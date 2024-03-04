@@ -17,5 +17,6 @@ cmd
 Makefile
 tailwind.config.js
 input.css
+test
 
 node_modules
