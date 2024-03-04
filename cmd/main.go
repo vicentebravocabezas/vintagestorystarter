@@ -6,10 +6,12 @@ import (
 
 	// Blank-import the function package so the init() runs
 	"github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
+	"github.com/joho/godotenv"
 	_ "vicentebravocabezas.com/vintagestorystarter"
 )
 
 func main() {
+	godotenv.Load()
 	// Use PORT environment variable, or default to 8080.
 	port := "8080"
 	if envPort := os.Getenv("PORT"); envPort != "" {
