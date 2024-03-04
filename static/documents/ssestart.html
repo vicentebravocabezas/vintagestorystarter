@@ -7,21 +7,27 @@
 		<link rel="preconnect" href="https://fonts.googleapis.com" />
 		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
 		<link href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,100;1,200;1,300;1,400;1,500;1,600;1,700;1,800;1,900&display=swap" rel="stylesheet" />
-        <link rel="stylesheet" href="app.css"/>
-    </head>
+		<link rel="stylesheet" href="app.css" />
+	</head>
 	<body class="bg-stone-200 font-poppins">
 		<div class="h-dvh flex justify-center p-4 items-center">
 			<div class="border w-full max-w-md p-4 bg-white rounded-lg shadow-lg">
 				<div class="flex flex-col justify-self-center p-6 text-center space-y-2">
-					<h3 class="text-3xl font-bold">Wazzup</h3>
-					<p class="text-sm text-gray-500">Enter the credential(s)</p>
-					<form method="post" class="flex flex-col pt-6">
-						<label class="text-sm font-medium text-left" for="pass">Password</label>
-						<input class="h-8 mt-2 text-sm" type="password" id="pass" name="password" required />
-						<button type="submit" class="px-4 py-2 mt-8 bg-black text-white w-fit self-center rounded font-medium hover:bg-zinc-800 focus:bg-zinc-600 shadow transition-all">Submit</button>
-					</form>
+					<div id="content" class="flex flex-col items-center">
+						<img src="bars.svg" width="54" height="56" class="mb-5" />
+						<p>Starting server...</p>
+					</div>
 				</div>
 			</div>
 		</div>
+		<script>
+			const source = new EventSource("sse");
+			source.onmessage = (evt) => {
+				document.getElementById("content").innerHTML = evt.data;
+			};
+			source.onerror = () => {
+				source.close();
+			};
+		</script>
 	</body>
 </html>
