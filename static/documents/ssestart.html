@@ -21,7 +21,7 @@
 			</div>
 		</div>
 		<script>
-			const source = new EventSource("sse");
+			const source = new EventSource("vs-starter/sse");
 			source.onmessage = (evt) => {
 				document.getElementById("content").innerHTML = evt.data;
 			};
