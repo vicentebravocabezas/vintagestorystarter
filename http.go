@@ -26,7 +26,7 @@ import (
 var assets embed.FS
 
 func init() {
-	functions.HTTP("Handler", handler)
+	functions.HTTP("starter", handler)
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -49,129 +49,136 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, string(bars))
 		return
 	}
-	ctx := context.Background()
+	ctx := r.Context()
 
 	store := sessions.NewCookieStore(decodeKey(os.Getenv("SESSION_KEY")))
 
 	if r.Header.Get("Accept") == "text/event-stream" && r.URL.Path == "/sse" {
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Connection", "keep-alive")
-
-		sess, err := store.Get(r, "session")
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		if sess.Values["accessToken"] == nil {
-			log.Fatal(err)
-		}
-
-		if _, err := jwt.Parse(sess.Values["accessToken"].(string), func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-			return decodeKey(os.Getenv("SIGNING_KEY")), nil
-		}); err != nil {
-			log.Fatal(err)
-		}
-
-		IPAddress := r.Header.Get("X-Real-Ip")
-
-		if IPAddress == "" {
-			IPAddress = r.Header.Get("X-Forwarded-For")
-		}
-
-		if IPAddress == "" {
-			IPAddress = r.RemoteAddr
-		}
-
-		parsedIP := netip.MustParseAddr(IPAddress)
-
-		addr4, addr6, err := startInstance(ctx)
-		if err != nil {
-			log.Fatalf("error starting instance: %v", err)
-		}
-
-		sse1, _ := assets.ReadFile("static/documents/sse1.html")
-
-		template.Must(template.New("sse1").Parse(string(sse1))).Execute(w, nil)
-		w.(http.Flusher).Flush()
-
-		if err := updateFirewall(ctx, parsedIP); err != nil {
-			log.Fatalf("error updating firewall: %v", err)
-		}
-
-		var addr string
-
-		if parsedIP.Is4() {
-			addr = addr4
-		} else {
-			addr = addr6
-		}
-
-		sse2, _ := assets.ReadFile("static/documents/sse2.html")
-
-		template.Must(template.New("sse2").Parse(string(sse2))).Execute(w, map[string]any{"ClientAddr": parsedIP.String(), "ServerAddr": addr})
-
-		r.Context().Done()
-
+		sse(ctx, store, w, r)
 		return
 	}
 
 	if r.Method == "POST" {
-		if err := r.ParseForm(); err != nil {
-			log.Fatalf("error parsing form: %v", err)
-		}
-
-		pass := r.Form.Get("password")
-
-		if err := bcrypt.CompareHashAndPassword([]byte("$2a$10$"+os.Getenv("PASSWORD")), []byte(pass)); err != nil {
-			fmt.Fprint(w, "wrong password")
-			return
-		}
-
-		tokExpiration := time.Now().Add(10*time.Minute + time.Duration(rand.Intn(61)-30)*time.Second)
-
-		tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			NotBefore: jwt.NewNumericDate(time.Now()),
-			ExpiresAt: jwt.NewNumericDate(tokExpiration),
-			ID:        uuid.NewString(),
-		}).SignedString(decodeKey(os.Getenv("SIGNING_KEY")))
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		sess, err := store.Get(r, "session")
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		sess.Options = &sessions.Options{
-			Path:     "/",
-			MaxAge:   int(tokExpiration.Unix() - time.Now().Unix()),
-			HttpOnly: true,
-			Secure:   true,
-			SameSite: http.SameSiteStrictMode,
-		}
-
-		sess.Values["accessToken"] = tok
-
-		if err := sess.Save(r, w); err != nil {
-			log.Fatal(err)
-		}
-
-		ssestart, _ := assets.ReadFile("static/documents/ssestart.html")
-
-		template.Must(template.New("ssestart").Parse(string(ssestart))).Execute(w, nil)
-
+		post(store, w, r)
 		return
 	}
 
 	index, _ := assets.ReadFile("static/documents/index.html")
 
-	template.Must(template.New("index").Parse(string(index))).Execute(w, nil)
+	w.Write(index)
+}
+
+func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Connection", "keep-alive")
+
+	sess, err := store.Get(r, "session")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if sess.Values["accessToken"] == nil {
+		log.Fatal(err)
+	}
+
+	if _, err := jwt.Parse(sess.Values["accessToken"].(string), func(token *jwt.Token) (any, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return decodeKey(os.Getenv("SIGNING_KEY")), nil
+	}); err != nil {
+		log.Fatal(err)
+	}
+
+	IPAddress := r.Header.Get("X-Real-Ip")
+
+	if IPAddress == "" {
+		IPAddress = r.Header.Get("X-Forwarded-For")
+	}
+
+	if IPAddress == "" {
+		IPAddress = r.RemoteAddr
+	}
+
+	parsedIP := netip.MustParseAddr(IPAddress)
+
+	addr4, addr6, err := startInstance(ctx)
+	if err != nil {
+		log.Fatalf("error starting instance: %v", err)
+	}
+
+	sse1, _ := assets.ReadFile("static/documents/sse1.html")
+
+	w.Write(sse1)
+	w.(http.Flusher).Flush()
+
+	if err := updateFirewall(ctx, parsedIP); err != nil {
+		log.Fatalf("error updating firewall: %v", err)
+	}
+
+	var addr string
+
+	if parsedIP.Is4() {
+		addr = addr4
+	} else {
+		addr = addr6
+	}
+
+	sse2, _ := assets.ReadFile("static/documents/sse2.html")
+
+	template.Must(template.New("sse2").Parse(string(sse2))).Execute(w, map[string]any{"ClientAddr": parsedIP.String(), "ServerAddr": addr})
+
+	ctx.Done()
+}
+
+func post(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		log.Fatalf("error parsing form: %v", err)
+	}
+
+	pass := r.Form.Get("password")
+
+	if err := bcrypt.CompareHashAndPassword([]byte("$2a$12$"+os.Getenv("PASSWORD")), []byte(pass)); err != nil {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, "wrong password")
+		return
+	}
+
+	tokExpiration := time.Now().Add(10*time.Minute + time.Duration(rand.Intn(61)-30)*time.Second)
+
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		NotBefore: jwt.NewNumericDate(time.Now()),
+		ExpiresAt: jwt.NewNumericDate(tokExpiration),
+		ID:        uuid.NewString(),
+	}).SignedString(decodeKey(os.Getenv("SIGNING_KEY")))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sess, err := store.Get(r, "session")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sess.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   int(tokExpiration.Unix() - time.Now().Unix()),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	}
+
+	sess.Values["accessToken"] = tok
+
+	if err := sess.Save(r, w); err != nil {
+		log.Fatal(err)
+	}
+
+	ssestart, _ := assets.ReadFile("static/documents/ssestart.html")
+
+	w.Write(ssestart)
 }
 
 func decodeKey(encoded string) []byte {
@@ -183,9 +190,9 @@ func updateFirewall(ctx context.Context, ip netip.Addr) error {
 	var firewallName string
 
 	if ip.Is4() {
-		firewallName = "vintagestory-ipv4"
+		firewallName = os.Getenv("FIREWALL_IP4")
 	} else {
-		firewallName = "vintagestory-ipv6"
+		firewallName = os.Getenv("FIREWALL_IP6")
 	}
 
 	f, err := compute.NewFirewallsRESTClient(ctx)
@@ -217,7 +224,7 @@ func updateFirewall(ctx context.Context, ip netip.Addr) error {
 	}
 
 	if !patch.Done() {
-		return fmt.Errorf("operation failed")
+		panic("operation failed")
 	}
 
 	return nil
@@ -230,7 +237,7 @@ func startInstance(ctx context.Context) (string, string, error) {
 	}
 
 	ins1, err := c.Get(ctx, &computepb.GetInstanceRequest{
-		Instance: "vintagestory1",
+		Instance: os.Getenv("INSTANCE_NAME"),
 		Project:  os.Getenv("PROJECT_NAME"),
 		Zone:     os.Getenv("ZONE"),
 	})
@@ -240,7 +247,7 @@ func startInstance(ctx context.Context) (string, string, error) {
 
 	if *ins1.Status == "TERMINATED" {
 		op, err := c.Start(ctx, &computepb.StartInstanceRequest{
-			Instance: "vintagestory1",
+			Instance: os.Getenv("INSTANCE_NAME"),
 			Project:  os.Getenv("PROJECT_NAME"),
 			Zone:     os.Getenv("ZONE"),
 		})
@@ -254,7 +261,7 @@ func startInstance(ctx context.Context) (string, string, error) {
 	}
 
 	ins2, err := c.Get(ctx, &computepb.GetInstanceRequest{
-		Instance: "vintagestory1",
+		Instance: os.Getenv("INSTANCE_NAME"),
 		Project:  os.Getenv("PROJECT_NAME"),
 		Zone:     os.Getenv("ZONE"),
 	})
