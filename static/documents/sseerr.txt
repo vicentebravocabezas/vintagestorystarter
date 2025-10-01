@@ -1,0 +1,2 @@
+data: <h3 class="font-medium text-lg">{{.Status}}</h3><p class="mt-6">{{.Error}}</p>
+

@@ -4,9 +4,10 @@ import (
 	"context"
 	"embed"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"html/template"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"net/netip"
@@ -68,6 +69,23 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	w.Write(index)
 }
 
+func sseError(w http.ResponseWriter, status int, msg string, args ...any) {
+	f, _ := assets.ReadFile("static/documents/sseerror.txt")
+
+	t := template.Must(template.New("ss2").Parse(string(f)))
+
+	t.Execute(w, map[string]string{
+		"Status": http.StatusText(status),
+	})
+	slog.Error(msg, args...)
+}
+
+func htmlError(w http.ResponseWriter, status int, msg string, args ...any) {
+	w.WriteHeader(status)
+	w.Write([]byte(http.StatusText(status)))
+	slog.Error(msg, args...)
+}
+
 func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -75,20 +93,17 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 
 	sess, err := store.Get(r, "session")
 	if err != nil {
-		log.Fatal(err)
+		sseError(w, http.StatusInternalServerError, "Could not obtain session from cookie: %s", err)
 	}
 
 	if sess.Values["accessToken"] == nil {
-		log.Fatal(err)
+		sseError(w, http.StatusInternalServerError, "Could not obtain access token from cookie: %s", err)
 	}
 
-	if _, err := jwt.Parse(sess.Values["accessToken"].(string), func(token *jwt.Token) (any, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
+	if _, err := jwt.Parse(sess.Values["accessToken"].(string), func(t *jwt.Token) (any, error) {
 		return decodeKey(os.Getenv("SIGNING_KEY")), nil
-	}); err != nil {
-		log.Fatal(err)
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()})); err != nil {
+		sseError(w, http.StatusInternalServerError, "")
 	}
 
 	IPAddress := r.Header.Get("X-Real-Ip")
@@ -103,18 +118,27 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 
 	parsedIP := netip.MustParseAddr(IPAddress)
 
-	addr4, addr6, err := startInstance(ctx)
+	instanceClient, err := compute.NewInstancesRESTClient(ctx)
 	if err != nil {
-		log.Fatalf("error starting instance: %v", err)
+		sseError(w, http.StatusInternalServerError, "unable to obtain client for instances: %w", err)
 	}
 
-	sse1, _ := assets.ReadFile("static/documents/sse1.html")
+	if err := startInstance(ctx, instanceClient); err != nil {
+		sseError(w, http.StatusInternalServerError, "error starting instance: %v", err)
+	}
+
+	addr4, addr6, err := obtainAddr(ctx, instanceClient)
+	if err != nil {
+		sseError(w, http.StatusInternalServerError, "unable to obtain instance address: %w", err)
+	}
+
+	sse1, _ := assets.ReadFile("static/documents/sse1.txt")
 
 	w.Write(sse1)
 	w.(http.Flusher).Flush()
 
 	if err := updateFirewall(ctx, parsedIP); err != nil {
-		log.Fatalf("error updating firewall: %v", err)
+		sseError(w, http.StatusInternalServerError, "error updating firewall: %w", err)
 	}
 
 	var addr string
@@ -125,7 +149,7 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 		addr = addr6
 	}
 
-	sse2, _ := assets.ReadFile("static/documents/sse2.html")
+	sse2, _ := assets.ReadFile("static/documents/sse2.txt")
 
 	template.Must(template.New("sse2").Parse(string(sse2))).Execute(w, map[string]any{"ClientAddr": parsedIP.String(), "ServerAddr": addr})
 
@@ -134,7 +158,7 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 
 func post(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		log.Fatalf("error parsing form: %v", err)
+		htmlError(w, http.StatusInternalServerError, "error parsing form: %v", err)
 	}
 
 	pass := r.Form.Get("password")
@@ -154,12 +178,12 @@ func post(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
 		ID:        uuid.NewString(),
 	}).SignedString(decodeKey(os.Getenv("SIGNING_KEY")))
 	if err != nil {
-		log.Fatal(err)
+		htmlError(w, http.StatusInternalServerError, err.Error())
 	}
 
 	sess, err := store.Get(r, "session")
 	if err != nil {
-		log.Fatal(err)
+		htmlError(w, http.StatusInternalServerError, err.Error())
 	}
 
 	sess.Options = &sessions.Options{
@@ -173,7 +197,7 @@ func post(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
 	sess.Values["accessToken"] = tok
 
 	if err := sess.Save(r, w); err != nil {
-		log.Fatal(err)
+		htmlError(w, http.StatusInternalServerError, err.Error())
 	}
 
 	ssestart, _ := assets.ReadFile("static/documents/ssestart.html")
@@ -230,48 +254,75 @@ func updateFirewall(ctx context.Context, ip netip.Addr) error {
 	return nil
 }
 
-func startInstance(ctx context.Context) (string, string, error) {
-	c, err := compute.NewInstancesRESTClient(ctx)
-	if err != nil {
-		return "", "", err
-	}
-
-	ins1, err := c.Get(ctx, &computepb.GetInstanceRequest{
+func obtainAddr(ctx context.Context, c *compute.InstancesClient) (string, string, error) {
+	ins, err := c.Get(ctx, &computepb.GetInstanceRequest{
 		Instance: os.Getenv("INSTANCE_NAME"),
 		Project:  os.Getenv("PROJECT_NAME"),
 		Zone:     os.Getenv("ZONE"),
 	})
 	if err != nil {
+		return "", "", fmt.Errorf("unable to get information about the instance: %w", err)
+	}
+
+	if ins == nil {
+		return "", "", errors.New("Could not obtain instance information. InstancesClient.Get resulted in <nil>")
+	}
+
+	if len(ins.NetworkInterfaces) < 1 {
+		return "", "", errors.New("Instance has no network interfaces")
+	}
+
+	if len(ins.NetworkInterfaces[0].AccessConfigs) < 1 {
+		return "", "", errors.New("The default network interface of the instance has no 'AccessConfigs' struct")
+	}
+
+	addr4, err := netip.ParseAddr(ins.NetworkInterfaces[0].AccessConfigs[0].GetNatIP())
+	if err != nil {
 		return "", "", err
 	}
 
-	if *ins1.Status == "TERMINATED" {
-		op, err := c.Start(ctx, &computepb.StartInstanceRequest{
-			Instance: os.Getenv("INSTANCE_NAME"),
-			Project:  os.Getenv("PROJECT_NAME"),
-			Zone:     os.Getenv("ZONE"),
-		})
-		if err != nil {
-			return "", "", err
-		}
-
-		if err := op.Wait(ctx); err != nil {
-			return "", "", err
-		}
+	addr6, err := netip.ParseAddr(ins.NetworkInterfaces[0].Ipv6AccessConfigs[0].GetExternalIpv6())
+	if err != nil {
+		return "", "", err
 	}
 
-	ins2, err := c.Get(ctx, &computepb.GetInstanceRequest{
+	return addr4.String(), addr6.String(), nil
+}
+
+func startInstance(ctx context.Context, c *compute.InstancesClient) error {
+	ins, err := c.Get(ctx, &computepb.GetInstanceRequest{
 		Instance: os.Getenv("INSTANCE_NAME"),
 		Project:  os.Getenv("PROJECT_NAME"),
 		Zone:     os.Getenv("ZONE"),
 	})
 	if err != nil {
-		return "", "", err
+		return fmt.Errorf("unable to get information about the instance: %w", err)
 	}
 
-	addr4 := netip.MustParseAddr(ins2.NetworkInterfaces[0].AccessConfigs[0].GetNatIP()).String()
+	if ins == nil {
+		return errors.New("Could not obtain instance information. InstancesClient.Get resulted in <nil>")
+	}
 
-	addr6 := netip.MustParseAddr(ins2.NetworkInterfaces[0].Ipv6AccessConfigs[0].GetExternalIpv6()).String()
+	if ins.Status == nil {
+		return errors.New("unable to obtain instance status. Status field is <nil>")
+	}
 
-	return addr4, addr6, nil
+	if *ins.Status != "TERMINATED" {
+		return nil
+	}
+
+	op, err := c.Start(ctx, &computepb.StartInstanceRequest{
+		Instance: os.Getenv("INSTANCE_NAME"),
+		Project:  os.Getenv("PROJECT_NAME"),
+		Zone:     os.Getenv("ZONE"),
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := op.Wait(ctx); err != nil {
+		return err
+	}
+
+	return nil
 }

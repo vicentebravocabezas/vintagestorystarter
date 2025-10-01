@@ -1,1 +1,2 @@
 data: <img src="/bars.svg" width="54" height="56" class="mb-5" /><p>Server Started, authorizing IP address...</p>
+
