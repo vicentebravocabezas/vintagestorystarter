@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"sync"
 	"time"
 
 	compute "cloud.google.com/go/compute/apiv1"
@@ -25,6 +26,8 @@ import (
 
 //go:embed all:static
 var assets embed.FS
+
+var mu sync.Mutex
 
 func init() {
 	functions.HTTP("starter", handler)
@@ -123,9 +126,11 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 		sseError(w, http.StatusInternalServerError, "unable to obtain client for instances: %w", err)
 	}
 
+	mu.Lock()
 	if err := startInstance(ctx, instanceClient); err != nil {
 		sseError(w, http.StatusInternalServerError, "error starting instance: %v", err)
 	}
+	mu.Unlock()
 
 	addr4, addr6, err := obtainAddr(ctx, instanceClient)
 	if err != nil {
