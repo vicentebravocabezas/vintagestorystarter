@@ -72,14 +72,27 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	w.Write(index)
 }
 
+func sseInfo(w http.ResponseWriter, msg, detail string) {
+	f, _ := assets.ReadFile("static/documents/sseerr.txt")
+
+	t := template.Must(template.New("ss2").Parse(string(f)))
+
+	t.Execute(w, map[string]string{
+		"Status": msg,
+		"Error":  detail,
+	})
+	w.(http.Flusher).Flush()
+}
+
 func sseError(w http.ResponseWriter, status int, msg string, args ...any) {
-	f, _ := assets.ReadFile("static/documents/sseerror.txt")
+	f, _ := assets.ReadFile("static/documents/sseerr.txt")
 
 	t := template.Must(template.New("ss2").Parse(string(f)))
 
 	t.Execute(w, map[string]string{
 		"Status": http.StatusText(status),
 	})
+	w.(http.Flusher).Flush()
 	slog.Error(msg, args...)
 }
 
@@ -97,16 +110,19 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 	sess, err := store.Get(r, "session")
 	if err != nil {
 		sseError(w, http.StatusInternalServerError, "could not obtain session from cookie", "err", err)
+		return
 	}
 
 	if sess.Values["accessToken"] == nil {
 		sseError(w, http.StatusInternalServerError, "Could not obtain access token from cookie", "err", err)
+		return
 	}
 
 	if _, err := jwt.Parse(sess.Values["accessToken"].(string), func(t *jwt.Token) (any, error) {
 		return decodeKey(os.Getenv("SIGNING_KEY")), nil
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()})); err != nil {
 		sseError(w, http.StatusInternalServerError, "could not decode access token", "err", err)
+		return
 	}
 
 	IPAddress := r.Header.Get("X-Real-Ip")
@@ -124,17 +140,27 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 	instanceClient, err := compute.NewInstancesRESTClient(ctx)
 	if err != nil {
 		sseError(w, http.StatusInternalServerError, "unable to obtain client for instances", "err", err)
+		return
 	}
 
 	mu.Lock()
-	if err := startInstance(ctx, instanceClient); err != nil {
-		sseError(w, http.StatusInternalServerError, "error starting instance: %v", "err", err)
-	}
+	err = startInstance(ctx, instanceClient)
 	mu.Unlock()
+	if err != nil {
+		if errors.Is(err, ErrInstanceStopping) {
+			sseInfo(w, "Instance is currently stopping", "Try again in a few minutes")
+			return
+		}
+		if !errors.Is(err, ErrInstanceNotTerminated) {
+			sseError(w, http.StatusInternalServerError, "error starting instance: %v", "err", err)
+			return
+		}
+	}
 
 	addr4, addr6, err := obtainAddr(ctx, instanceClient)
 	if err != nil {
 		sseError(w, http.StatusInternalServerError, "unable to obtain instance address: %w", "err", err)
+		return
 	}
 
 	sse1, _ := assets.ReadFile("static/documents/sse1.txt")
@@ -143,10 +169,12 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 	w.(http.Flusher).Flush()
 
 	mu.Lock()
-	if err := updateFirewall(ctx, parsedIP); err != nil {
-		sseError(w, http.StatusInternalServerError, "error updating firewall", "err", err)
-	}
+	err = updateFirewall(ctx, parsedIP)
 	mu.Unlock()
+	if err != nil {
+		sseError(w, http.StatusInternalServerError, "error updating firewall", "err", err)
+		return
+	}
 
 	var addr string
 
@@ -166,6 +194,7 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 func post(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		htmlError(w, http.StatusBadRequest, "invalid data received", "err", err)
+		return
 	}
 
 	pass := r.Form.Get("password")
@@ -186,11 +215,13 @@ func post(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
 	}).SignedString(decodeKey(os.Getenv("SIGNING_KEY")))
 	if err != nil {
 		htmlError(w, http.StatusInternalServerError, "could not decode access token", "err", err)
+		return
 	}
 
 	sess, err := store.Get(r, "session")
 	if err != nil {
 		htmlError(w, http.StatusInternalServerError, "could not obtain session from cookie", "err", err.Error())
+		return
 	}
 
 	sess.Options = &sessions.Options{
@@ -205,6 +236,7 @@ func post(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
 
 	if err := sess.Save(r, w); err != nil {
 		htmlError(w, http.StatusInternalServerError, "was not able to save cookie session", "err", err.Error())
+		return
 	}
 
 	ssestart, _ := assets.ReadFile("static/documents/ssestart.html")
@@ -292,6 +324,9 @@ func obtainAddr(ctx context.Context, c *compute.InstancesClient) (string, string
 	return addr4.String(), addr6.String(), nil
 }
 
+var ErrInstanceNotTerminated = errors.New("instance is not terminated")
+var ErrInstanceStopping = errors.New("instance is currently stopping")
+
 func startInstance(ctx context.Context, c *compute.InstancesClient) error {
 	ins, err := c.Get(ctx, &computepb.GetInstanceRequest{
 		Instance: os.Getenv("INSTANCE_NAME"),
@@ -310,9 +345,14 @@ func startInstance(ctx context.Context, c *compute.InstancesClient) error {
 		return errors.New("unable to obtain instance status. Status field is <nil>")
 	}
 
+	if *ins.Status == "STOPPING" || *ins.Status == "SUSPENDING" || *ins.Status == "REPAIRING" {
+		slog.Info("Instance is stopping", "status", *ins.Status)
+		return ErrInstanceStopping
+	}
+
 	if *ins.Status != "TERMINATED" {
-		slog.Info("Instance is already running", "status", ins.Status)
-		return nil
+		slog.Info("Instance is already running or starting up", "status", *ins.Status)
+		return ErrInstanceNotTerminated
 	}
 
 	op, err := c.Start(ctx, &computepb.StartInstanceRequest{
