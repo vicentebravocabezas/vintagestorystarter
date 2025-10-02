@@ -96,17 +96,17 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 
 	sess, err := store.Get(r, "session")
 	if err != nil {
-		sseError(w, http.StatusInternalServerError, "Could not obtain session from cookie: %s", err)
+		sseError(w, http.StatusInternalServerError, "could not obtain session from cookie", "err", err)
 	}
 
 	if sess.Values["accessToken"] == nil {
-		sseError(w, http.StatusInternalServerError, "Could not obtain access token from cookie: %s", err)
+		sseError(w, http.StatusInternalServerError, "Could not obtain access token from cookie", "err", err)
 	}
 
 	if _, err := jwt.Parse(sess.Values["accessToken"].(string), func(t *jwt.Token) (any, error) {
 		return decodeKey(os.Getenv("SIGNING_KEY")), nil
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()})); err != nil {
-		sseError(w, http.StatusInternalServerError, "")
+		sseError(w, http.StatusInternalServerError, "could not decode access token", "err", err)
 	}
 
 	IPAddress := r.Header.Get("X-Real-Ip")
@@ -123,18 +123,18 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 
 	instanceClient, err := compute.NewInstancesRESTClient(ctx)
 	if err != nil {
-		sseError(w, http.StatusInternalServerError, "unable to obtain client for instances: %w", err)
+		sseError(w, http.StatusInternalServerError, "unable to obtain client for instances", "err", err)
 	}
 
 	mu.Lock()
 	if err := startInstance(ctx, instanceClient); err != nil {
-		sseError(w, http.StatusInternalServerError, "error starting instance: %v", err)
+		sseError(w, http.StatusInternalServerError, "error starting instance: %v", "err", err)
 	}
 	mu.Unlock()
 
 	addr4, addr6, err := obtainAddr(ctx, instanceClient)
 	if err != nil {
-		sseError(w, http.StatusInternalServerError, "unable to obtain instance address: %w", err)
+		sseError(w, http.StatusInternalServerError, "unable to obtain instance address: %w", "err", err)
 	}
 
 	sse1, _ := assets.ReadFile("static/documents/sse1.txt")
@@ -142,9 +142,11 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 	w.Write(sse1)
 	w.(http.Flusher).Flush()
 
+	mu.Lock()
 	if err := updateFirewall(ctx, parsedIP); err != nil {
-		sseError(w, http.StatusInternalServerError, "error updating firewall: %w", err)
+		sseError(w, http.StatusInternalServerError, "error updating firewall", "err", err)
 	}
+	mu.Unlock()
 
 	var addr string
 
@@ -163,7 +165,7 @@ func sse(ctx context.Context, store *sessions.CookieStore, w http.ResponseWriter
 
 func post(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		htmlError(w, http.StatusInternalServerError, "error parsing form: %v", err)
+		htmlError(w, http.StatusBadRequest, "invalid data received", "err", err)
 	}
 
 	pass := r.Form.Get("password")
@@ -183,12 +185,12 @@ func post(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
 		ID:        uuid.NewString(),
 	}).SignedString(decodeKey(os.Getenv("SIGNING_KEY")))
 	if err != nil {
-		htmlError(w, http.StatusInternalServerError, err.Error())
+		htmlError(w, http.StatusInternalServerError, "could not decode access token", "err", err)
 	}
 
 	sess, err := store.Get(r, "session")
 	if err != nil {
-		htmlError(w, http.StatusInternalServerError, err.Error())
+		htmlError(w, http.StatusInternalServerError, "could not obtain session from cookie", "err", err.Error())
 	}
 
 	sess.Options = &sessions.Options{
@@ -202,7 +204,7 @@ func post(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) {
 	sess.Values["accessToken"] = tok
 
 	if err := sess.Save(r, w); err != nil {
-		htmlError(w, http.StatusInternalServerError, err.Error())
+		htmlError(w, http.StatusInternalServerError, "was not able to save cookie session", "err", err.Error())
 	}
 
 	ssestart, _ := assets.ReadFile("static/documents/ssestart.html")
@@ -226,7 +228,7 @@ func updateFirewall(ctx context.Context, ip netip.Addr) error {
 
 	f, err := compute.NewFirewallsRESTClient(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to create firewall client: %w", err)
 	}
 
 	get, err := f.Get(ctx, &computepb.GetFirewallRequest{
@@ -234,7 +236,7 @@ func updateFirewall(ctx context.Context, ip netip.Addr) error {
 		Project:  os.Getenv("PROJECT_NAME"),
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to get firewall information: %w", err)
 	}
 
 	patch, err := f.Patch(ctx, &computepb.PatchFirewallRequest{
@@ -245,15 +247,11 @@ func updateFirewall(ctx context.Context, ip netip.Addr) error {
 		Project: os.Getenv("PROJECT_NAME"),
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to update firewall sources: %w", err)
 	}
 
 	if err := patch.Wait(ctx); err != nil {
-		return err
-	}
-
-	if !patch.Done() {
-		panic("operation failed")
+		return fmt.Errorf("error while waiting for firewall update: %w", err)
 	}
 
 	return nil
@@ -313,6 +311,7 @@ func startInstance(ctx context.Context, c *compute.InstancesClient) error {
 	}
 
 	if *ins.Status != "TERMINATED" {
+		slog.Info("Instance is already running", "status", ins.Status)
 		return nil
 	}
 
@@ -322,11 +321,11 @@ func startInstance(ctx context.Context, c *compute.InstancesClient) error {
 		Zone:     os.Getenv("ZONE"),
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to start instance: %w", err)
 	}
 
 	if err := op.Wait(ctx); err != nil {
-		return err
+		return fmt.Errorf("error while waiting for instance to start: %w", err)
 	}
 
 	return nil
